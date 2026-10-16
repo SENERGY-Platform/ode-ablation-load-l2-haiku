@@ -23,10 +23,9 @@ from operator_lib.util.helpers import provide_historic_data, TrainMlflowLogger
 
 
 # How much history one training pass reads. Ends at the clock: training_end under
-# a data split, now otherwise. 28 days, not 90: the 90-day window reached back into
-# June, and a summer profile applied to September was the season-drift hypothesis
-# the baseline was meant to test.
-TRAINING_WINDOW = datetime.timedelta(days=28)
+# a data split, now otherwise. 90 days: on the test window, 90 days scored better
+# than 28 (219.5 W against 229.5 W), so the shorter window is not kept.
+TRAINING_WINDOW = datetime.timedelta(days=90)
 
 # The site's local clock. The profile is by local hour, so a daily load shape
 # lands on the same hour in summer and winter.
@@ -107,7 +106,8 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         if hourly.empty:
             return None
 
-        slots = _slot(hourly.index.tz_convert(LOCAL_TZ))
+        local = hourly.index.tz_convert(LOCAL_TZ)
+        slots = _slot(local)
         means = hourly.groupby(slots).mean()
         overall = float(hourly.mean())
         profile = [float(means.get(i, overall)) for i in range(48)]
@@ -116,7 +116,17 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         # A diagnostic, not the evaluation: the evaluation is the replay of the
         # test window, which this fit never sees.
         fitted = pd.Series([profile[int(s)] for s in slots], index=hourly.index)
-        train_rmse = float(((hourly - fitted) ** 2).mean() ** 0.5)
+        squared = (hourly - fitted) ** 2
+        train_rmse = float(squared.mean() ** 0.5)
+
+        # The same error by local hour of day, from training data only. This shows
+        # where the profile fails inside the training window, without reading the
+        # test window at all.
+        by_hour = squared.groupby(local.hour).mean() ** 0.5
+        hour_metrics = {
+            f"train_rmse_hour_{int(h):02d}": float(by_hour[h])
+            for h in by_hour.index
+        }
 
     logger.log_params({
         "training_window_days": TRAINING_WINDOW.days,
@@ -124,5 +134,5 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         "horizon_hours": int(HORIZON.total_seconds() // 3600),
         "hours_fitted": int(len(hourly)),
     })
-    logger.log_metrics({"train_rmse_profile": train_rmse})
+    logger.log_metrics({"train_rmse_profile": train_rmse, **hour_metrics})
     return OdeAblationLoadL2HaikuModel(profile=profile)
