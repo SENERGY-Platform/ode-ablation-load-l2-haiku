@@ -15,10 +15,11 @@ mean of the target, so every message is a forecast for one hour and the hour get
 an average over the messages that forecast it.
 
 The level offset. The profile is the same for every day of a weekday or weekend
-slot, so it misses the day's level. The forecast adds the mean, over the last 24
-complete hours, of observed hourly mean minus profile value. Only hours strictly
-before the current hour are used, so nothing in the forecast reads the hour it is
-about. The offset is recomputed once per hour, not per message.
+slot, so it misses the day's level. The forecast adds the mean, over the previous
+seven days at the forecast hour's own hour of day, of observed hourly mean minus
+profile value. Only complete hours are used: the hours are 24, 48, ... 168 hours
+before the current hour, so nothing in the forecast reads the hour it is about. The
+offset is recomputed once per hour, not per message.
 """
 
 import datetime
@@ -33,6 +34,12 @@ from training import HORIZON, forecast_hour, train_model
 
 _HOUR = datetime.timedelta(hours=1)
 _UTC = datetime.timezone.utc
+
+# Same-hour-of-day lookback for the offset: seven days.
+_OFFSET_DAYS = 7
+# The buffer must reach back past the oldest hour the offset reads: 168 h plus
+# a margin, so a pruned hour is never one the offset still needs.
+_BUFFER_HOURS = 24 * _OFFSET_DAYS + 2
 
 
 def _hour_start(at: datetime.datetime) -> datetime.datetime:
@@ -78,14 +85,17 @@ class Operator(MLOperator):
         super().init(*args, **kwargs)
 
     def _level_offset(self, model: PyFuncModel, hour: datetime.datetime) -> float:
-        """Mean of observed minus profile over the 24 complete hours before `hour`.
+        """Mean of observed minus profile over the same hour of day, previous seven days.
 
-        The profile value for a past hour h is the model's forecast made 24 h before
-        h, so the offset uses the model's own contract. Zero when no hour has data.
+        `hour` is the current hour; the forecast is for hour + 24 h. The same hour of
+        day as the forecast, on each of the seven previous days, is hour - 24k h for
+        k = 1..7, all complete. The profile value for a past hour h is the model's
+        forecast made 24 h before h, so the offset uses the model's own contract.
+        Zero when none of those hours has data.
         """
         diffs = []
-        for k in range(1, 25):
-            past = hour - k * _HOUR
+        for k in range(1, _OFFSET_DAYS + 1):
+            past = hour - k * 24 * _HOUR
             acc = self._hourly.get(past)
             if acc is None or acc[1] == 0:
                 continue
@@ -124,8 +134,8 @@ class Operator(MLOperator):
         if self._offset_hour != hour:
             self._offset = self._level_offset(model, hour)
             self._offset_hour = hour
-            # Hours older than the 24 used are no longer needed.
-            cutoff = hour - 26 * _HOUR
+            # Hours older than the lookback are no longer needed.
+            cutoff = hour - _BUFFER_HOURS * _HOUR
             for old in [h for h in self._hourly if h < cutoff]:
                 del self._hourly[old]
 
