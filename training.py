@@ -23,8 +23,10 @@ from operator_lib.util.helpers import provide_historic_data, TrainMlflowLogger
 
 
 # How much history one training pass reads. Ends at the clock: training_end under
-# a data split, now otherwise.
-TRAINING_WINDOW = datetime.timedelta(days=90)
+# a data split, now otherwise. 28 days, not 90: the 90-day window reached back into
+# June, and a summer profile applied to September was the season-drift hypothesis
+# the baseline was meant to test.
+TRAINING_WINDOW = datetime.timedelta(days=28)
 
 # The site's local clock. The profile is by local hour, so a daily load shape
 # lands on the same hour in summer and winter.
