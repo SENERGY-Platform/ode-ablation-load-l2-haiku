@@ -7,6 +7,12 @@ when need_retraining() says so. Training runs on Ray.
 
 Three methods are yours. Everything else — Kafka, the model registry, the
 lifecycle — belongs to the library.
+
+The forecast. Each message, seen at time t, emits the mean net grid power for the
+hour that starts at the hour after t + 24 h, timestamped with that hour. The
+evaluation buckets predictions by that timestamp and scores them against the
+hourly mean of the target, so every message is a forecast for one hour and the
+hour gets an average over the messages that forecast it.
 """
 
 import datetime
@@ -17,7 +23,7 @@ from mlflow.pyfunc import PyFuncModel, PythonModel
 from operator_lib.util import Config, MLOperator, Selector
 from operator_lib.util.helpers import TrainMlflowLogger
 
-from training import train_model
+from training import forecast_hour, train_model
 
 
 class CustomConfig(Config):
@@ -62,17 +68,15 @@ class Operator(MLOperator):
     ]:
         """Called for every message. Returns (result timestamp, result, new model).
 
-        The result timestamp may be None, which means now; it is what lets a
-        forecast carry the time it is about rather than the time it was made. The
-        third element replaces the registered model and is almost always None —
-        return one only from an algorithm that genuinely updates per message.
+        The result timestamp is the hour the forecast is about, 24 h after the
+        message, so the evaluation and any consumer read it at the time it describes.
+        The forecast is a profile and does not depend on the message's own value.
         """
-        value = data.get("value")
-        if value is None or model is None:
+        if model is None:
             return None, None, None
 
-        prediction = model.predict({"timestamp": timestamp, "value": float(value)})
-        return None, {"prediction": prediction}, None
+        prediction = model.predict({"timestamp": timestamp.isoformat()})
+        return forecast_hour(timestamp), {"prediction": float(prediction)}, None
 
     def train(
         self, model: typing.Optional[PyFuncModel], logger: TrainMlflowLogger
