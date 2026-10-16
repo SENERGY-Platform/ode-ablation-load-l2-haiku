@@ -9,10 +9,16 @@ Three methods are yours. Everything else — Kafka, the model registry, the
 lifecycle — belongs to the library.
 
 The forecast. Each message, seen at time t, emits the mean net grid power for the
-hour that starts at the hour after t + 24 h, timestamped with that hour. The
-evaluation buckets predictions by that timestamp and scores them against the
-hourly mean of the target, so every message is a forecast for one hour and the
-hour gets an average over the messages that forecast it.
+hour that starts 24 h after the start of t's hour, timestamped with that hour. The
+evaluation buckets predictions by that timestamp and scores them against the hourly
+mean of the target, so every message is a forecast for one hour and the hour gets
+an average over the messages that forecast it.
+
+The level offset. The profile is the same for every day of a weekday or weekend
+slot, so it misses the day's level. The forecast adds the mean, over the last 24
+complete hours, of observed hourly mean minus profile value. Only hours strictly
+before the current hour are used, so nothing in the forecast reads the hour it is
+about. The offset is recomputed once per hour, not per message.
 """
 
 import datetime
@@ -23,7 +29,18 @@ from mlflow.pyfunc import PyFuncModel, PythonModel
 from operator_lib.util import Config, MLOperator, Selector
 from operator_lib.util.helpers import TrainMlflowLogger
 
-from training import forecast_hour, train_model
+from training import HORIZON, forecast_hour, train_model
+
+_HOUR = datetime.timedelta(hours=1)
+_UTC = datetime.timezone.utc
+
+
+def _hour_start(at: datetime.datetime) -> datetime.datetime:
+    """The start of the UTC hour `at` falls into."""
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=_UTC)
+    at = at.astimezone(_UTC)
+    return at.replace(minute=0, second=0, microsecond=0)
 
 
 class CustomConfig(Config):
@@ -54,7 +71,28 @@ class Operator(MLOperator):
         # test window before it returns, so anything set after it is missing
         # during the replay and overwrites what train() just recorded.
         self.trained_at: typing.Optional[datetime.datetime] = None
+        # Hour start -> [sum, count] of observed values in that hour.
+        self._hourly: typing.Dict[datetime.datetime, list] = {}
+        self._offset_hour: typing.Optional[datetime.datetime] = None
+        self._offset = 0.0
         super().init(*args, **kwargs)
+
+    def _level_offset(self, model: PyFuncModel, hour: datetime.datetime) -> float:
+        """Mean of observed minus profile over the 24 complete hours before `hour`.
+
+        The profile value for a past hour h is the model's forecast made 24 h before
+        h, so the offset uses the model's own contract. Zero when no hour has data.
+        """
+        diffs = []
+        for k in range(1, 25):
+            past = hour - k * _HOUR
+            acc = self._hourly.get(past)
+            if acc is None or acc[1] == 0:
+                continue
+            observed = acc[0] / acc[1]
+            profile = float(model.predict({"timestamp": (past - HORIZON).isoformat()}))
+            diffs.append(observed - profile)
+        return sum(diffs) / len(diffs) if diffs else 0.0
 
     def infer(
         self,
@@ -69,13 +107,29 @@ class Operator(MLOperator):
         """Called for every message. Returns (result timestamp, result, new model).
 
         The result timestamp is the hour the forecast is about, 24 h after the
-        message, so the evaluation and any consumer read it at the time it describes.
-        The forecast is a profile and does not depend on the message's own value.
+        message's hour, so the evaluation and any consumer read it at the time it
+        describes.
         """
         if model is None:
             return None, None, None
 
-        prediction = model.predict({"timestamp": timestamp.isoformat()})
+        hour = _hour_start(timestamp)
+
+        value = data.get("value")
+        if value is not None:
+            acc = self._hourly.setdefault(hour, [0.0, 0])
+            acc[0] += float(value)
+            acc[1] += 1
+
+        if self._offset_hour != hour:
+            self._offset = self._level_offset(model, hour)
+            self._offset_hour = hour
+            # Hours older than the 24 used are no longer needed.
+            cutoff = hour - 26 * _HOUR
+            for old in [h for h in self._hourly if h < cutoff]:
+                del self._hourly[old]
+
+        prediction = model.predict({"timestamp": timestamp.isoformat()}) + self._offset
         return forecast_hour(timestamp), {"prediction": float(prediction)}, None
 
     def train(
